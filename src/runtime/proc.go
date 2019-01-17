@@ -97,6 +97,7 @@ var main_init_done chan bool
 //go:linkname main_main main.main
 func main_main()
 
+
 // mainStarted indicates that the main M has started.
 var mainStarted bool
 
@@ -2783,6 +2784,7 @@ func save(pc, sp uintptr) {
 func reentersyscall(pc, sp uintptr) {
 	_g_ := getg()
 
+	// locks++ 为了 防止在此操作期间，GC 此G 处理 内存垃圾
 	// Disable preemption because during this function g is in Gsyscall status,
 	// but can have inconsistent g->sched, do not let GC observe it.
 	_g_.m.locks++
@@ -2799,13 +2801,16 @@ func reentersyscall(pc, sp uintptr) {
 	_g_.syscallsp = sp
 	_g_.syscallpc = pc
 	casgstatus(_g_, _Grunning, _Gsyscall)
+	// sp 是stack 的栈顶 应该  _g_.stack.lo <  _g_.syscallsp = _g_.stack.hi
 	if _g_.syscallsp < _g_.stack.lo || _g_.stack.hi < _g_.syscallsp {
+		// 报异常
 		systemstack(func() {
 			print("entersyscall inconsistent ", hex(_g_.syscallsp), " [", hex(_g_.stack.lo), ",", hex(_g_.stack.hi), "]\n")
 			throw("entersyscall")
 		})
 	}
 
+	// 这是 trace 类似记录日志
 	if trace.enabled {
 		systemstack(traceGoSysCall)
 		// systemstack itself clobbers g.sched.{pc,sp} and we might
@@ -2814,22 +2819,29 @@ func reentersyscall(pc, sp uintptr) {
 		save(pc, sp)
 	}
 
+	// 系统的监控通知（事件机制）
+	// systemstack 系统栈 应该是 操作系统要执行的东西
+	// entersyscall_sysmon  这个应该是异步的东西吧
 	if atomic.Load(&sched.sysmonwait) != 0 {
 		systemstack(entersyscall_sysmon)
 		save(pc, sp)
 	}
 
+	// 执行方法
 	if _g_.m.p.ptr().runSafePointFn != 0 {
 		// runSafePointFn may stack split if run on this stack
 		systemstack(runSafePointFn)
 		save(pc, sp)
 	}
 
+	// tick
 	_g_.m.syscalltick = _g_.m.p.ptr().syscalltick
+	// 阻塞系统调用 打开日志
 	_g_.sysblocktraced = true
 	_g_.m.mcache = nil
 	_g_.m.p.ptr().m = 0
-	atomic.Store(&_g_.m.p.ptr().status, _Psyscall)
+	atomic.Store(&_g_.m.p.ptr().status, _Psyscall) // _Psyscall 物理调用？？
+	// GC 已经在等待，则把gc 的 方法 加到 系统 栈上
 	if sched.gcwaiting != 0 {
 		systemstack(entersyscall_gcwait)
 		save(pc, sp)
@@ -3011,6 +3023,7 @@ func exitsyscall() {
 }
 
 //go:nosplit
+// 系统调用回来的 G 符合需要 分配到 P 上（调度）。 1、尝试原来的P 2、1不成功则继续尝试其他P
 func exitsyscallfast() bool {
 	_g_ := getg()
 
@@ -3022,13 +3035,16 @@ func exitsyscallfast() bool {
 	}
 
 	// Try to re-acquire the last P.
+	// 复活后的G 尝试绑定到原来的主人P
 	if _g_.m.p != 0 && _g_.m.p.ptr().status == _Psyscall && atomic.Cas(&_g_.m.p.ptr().status, _Psyscall, _Prunning) {
 		// There's a cpu for us, so we can run.
 		exitsyscallfast_reacquired()
+		//成功
 		return true
 	}
 
 	// Try to get any other idle P.
+	// 前边没成功，则尝试其他空闲的 P
 	oldp := _g_.m.p.ptr()
 	_g_.m.mcache = nil
 	_g_.m.p = 0
@@ -4376,9 +4392,13 @@ type sysmontick struct {
 const forcePreemptNS = 10 * 1000 * 1000 // 10ms
 
 func retake(now int64) uint32 {
+	// 针对 P 的处理
 	n := 0
 	// Prevent allp slice changes. This lock will be completely
 	// uncontended unless we're already stopping the world.
+	// allpLock 是  mutex  ; mutex 是  uintptr； uintptr ； uintptr  是 uintptr is an integer type that is large enough to hold the bit pattern of any pointer.
+
+	// 所有 锁（P的）（1~n个P(一般与M的数量一致)） 锁住，检查  P<-->G 状态,根据条件 现在现状 ==》 决定是否 挂起
 	lock(&allpLock)
 	// We can't use a range loop over allp because we may
 	// temporarily drop the allpLock. Hence, we need to re-fetch
@@ -4386,23 +4406,31 @@ func retake(now int64) uint32 {
 	for i := 0; i < len(allp); i++ {
 		_p_ := allp[i]
 		if _p_ == nil {
+			// 这是可能发生的
 			// This can happen if procresize has grown
 			// allp but not yet created new Ps.
 			continue
 		}
+		// sysmon 上次监测 到 此P最后一条 tick ==》记录
 		pd := &_p_.sysmontick
-		s := _p_.status
-		if s == _Psyscall {
+		s := _p_.status // 状态
+		if s == _Psyscall { // P 处在系统调用状态
 			// Retake P from syscall if it's there for more than 1 sysmon tick (at least 20us).
-			t := int64(_p_.syscalltick)
-			if int64(pd.syscalltick) != t {
+			t := int64(_p_.syscalltick)  //  系统调用 tick
+			if int64(pd.syscalltick) != t { // p的系统调用tick 与 sysmon 监控记录的最后一条 不一致
+				// 修改 _p_.sysmontick 为现在的 正确的
 				pd.syscalltick = uint32(t)
 				pd.syscallwhen = now
+				// 不挂起 此 P (P  是 G 的代理，一个P对应 一个G .对 G 的处理需要 通过 P)
 				continue
 			}
 			// On the one hand we don't want to retake Ps if there is no other work to do,
 			// but on the other hand we want to retake them eventually
 			// because they can prevent the sysmon thread from deep sleep.
+			// 这个 10ms 在group.google.com 上有解释。。。。。。
+			// 不知道 GitHub 上有没有解释
+			// p 的 G 队列为空  && &&  p池 有空闲p && 执行时间 没超时
+			// nmspinning  是啥  n m  spining  spin(自旋的意思) 应该是 线程 的自旋（在没有任务的时候，m ()线程） 需要自旋 ）
 			if runqempty(_p_) && atomic.Load(&sched.nmspinning)+atomic.Load(&sched.npidle) > 0 && pd.syscallwhen+10*1000*1000 > now {
 				continue
 			}

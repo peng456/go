@@ -32,17 +32,23 @@ const (
 	passive_spin    = 1
 )
 
+// 这应该叫做 runtime 中的 锁 。go 语言中的 锁 可能与此还是 不同吧。
 func lock(l *mutex) {
-	gp := getg()
+	// gp  mp  都是 以 P 为中间的 。p 控制 g、m.
+	gp := getg()  //  gp 应该是 G  还是 P呢   ？？？  应该是 P代理的G （感觉还应该 是 G, 恩，就是。）
 	if gp.m.locks < 0 {
 		throw("runtime·lock: lock count")
 	}
-	gp.m.locks++
+	gp.m.locks++  // 此时的 线程 里面 锁的数量 + 1
 
-	// Speculative grab for lock.
+	// Speculative（预测） grab for lock.
+	// 如果已经加锁  ==》 则返回空   atomic.Casuintptr  这个应该是 很硬的方法了cas
+	// func Casuintptr(ptr *uintptr, old, new uintptr) bool
+	// 不猜了，有空在查吧 （应该是 判断 old new 是否相同）
 	if atomic.Casuintptr(&l.key, 0, locked) {
 		return
 	}
+	// sema create  应该是 创建 线程（m） 的锁吧
 	semacreate(gp.m)
 
 	// On uniprocessor's, no point spinning.

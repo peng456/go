@@ -271,6 +271,7 @@ func kevent_trampoline()
 //go:nosplit
 //go:cgo_unsafe_args
 func pthread_mutex_init(m *pthreadmutex, attr *pthreadmutexattr) int32 {
+	// 方法 压入 栈
 	return libcCall(unsafe.Pointer(funcPC(pthread_mutex_init_trampoline)), unsafe.Pointer(&m))
 }
 func pthread_mutex_init_trampoline()
